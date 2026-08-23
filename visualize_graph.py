@@ -10,6 +10,51 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def plot_instances_from_pipeline(instances, n_examples=3, model=None, device="cpu",
+                                  save_prefix="pipeline_example", seed=0):
+    """Plot REAL leave-one-out instances straight from your fold data
+    (instances_for_hosts() / run_nested_cv() output) -- not a hand-typed
+    example. Requires instances to include 'system_df' (added to
+    make_leave_one_out_instances() output).
+
+    If model is given, also runs a prediction and shows predicted vs true
+    (denormalized back to real units is NOT done here -- these are still
+    in normalized log-space, matching what the model actually sees/predicts;
+    say so in any figure caption).
+    """
+    import torch as _torch
+    rng = np.random.RandomState(seed)
+    chosen = rng.choice(len(instances), size=min(n_examples, len(instances)), replace=False)
+
+    saved_paths = []
+    for k, idx in enumerate(chosen):
+        inst = instances[idx]
+        if "system_df" not in inst:
+            raise KeyError(
+                "instance is missing 'system_df' -- re-run make_leave_one_out_instances() "
+                "from the current data_pipeline.py (older cached instances won't have this key)"
+            )
+
+        title = f"{inst['hostname']} (removed: index {inst['removed_index']} of {inst['n_planets']})"
+        if model is not None:
+            model.eval()
+            with _torch.no_grad():
+                g = inst["graph"]
+                batch = _torch.zeros(g.x.size(0), dtype=_torch.long)
+                pred = model(g.x, g.edge_index, batch, edge_attr=g.edge_attr, aux_feat=g.aux_feat)
+            true_val = inst["target_period_only"].item()
+            title += f"\npredicted (norm. log-period)={pred.item():.3f}  true={true_val:.3f}"
+
+        save_path = f"{save_prefix}_{k}.png"
+        plot_system_graph(inst["system_df"], removed_index=inst["removed_index"],
+                           title=title, save_path=save_path)
+        saved_paths.append(save_path)
+        plt.close()
+
+    print(f"Saved {len(saved_paths)} real pipeline examples: {saved_paths}")
+    return saved_paths
+
+
 def plot_system_graph(system_df, removed_index=None, title=None, save_path=None,
                        ax=None):
     """Plot one system's planets as a graph, sorted by orbital period.

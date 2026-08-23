@@ -25,12 +25,56 @@ from data_pipeline import (
     system_level_stratified_folds,
 )
 from models import build_model
+from baselines import fit_population_log_period_ratio, dynamite_style_baseline
 
 try:
     import wandb
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+
+def attach_dynamite_feature(instances, ratio_mean):
+    """Compute DYNAMITE-style's own prediction for each instance and attach
+    it as graph.dynamite_pred, so the GNN receives it as an input feature.
+
+    IMPORTANT -- this is now an OPT-IN secondary experiment, not the default.
+    Giving the GNN DYNAMITE's own answer as an input feature answers a
+    DIFFERENT question than the primary thesis question: it tests "does a
+    learned correction on top of DYNAMITE help" (a hybrid/ensemble claim),
+    not "can a graph model independently beat DYNAMITE" (the actual research
+    question). A model with strictly more information than its competitor
+    should rarely score worse, so "beats DYNAMITE" under this setup is close
+    to tautological and does NOT support the core thesis claim on its own.
+    Use include_dynamite_feature=True in run_nested_cv only for an explicitly
+    labeled secondary/hybrid comparison, never as your primary result.
+
+    ratio_mean MUST be fit on the corresponding TRAIN split only (via
+    fit_population_log_period_ratio) -- reuse the exact same value across
+    train/val/test instances for a given fold, never refit per-split.
+    """
+    for inst in instances:
+        pred = dynamite_style_baseline(inst, ratio_mean)
+        inst["graph"].dynamite_pred = torch.tensor([[pred]], dtype=torch.float)
+        inst["graph"].aux_feat = torch.cat(
+            [inst["graph"].gap_pos, inst["graph"].dynamite_pred], dim=-1
+        )
+    return instances
+
+
+def attach_null_aux_feature(instances):
+    """PRIMARY-PATH default: aux_feat = [gap_pos, 0] -- the GNN gets its
+    positional signal (gap_pos) but NOT DYNAMITE's answer. This is the
+    correct setup for the actual thesis question (can the GNN independently
+    beat DYNAMITE), keeping the architecture identical to the augmented
+    variant (same input dimensionality) so the two are a clean apples-to-
+    apples ablation, differing only in whether dynamite_pred is real or zero.
+    """
+    for inst in instances:
+        zero_col = torch.zeros((1, 1), dtype=torch.float)
+        inst["graph"].dynamite_pred = zero_col
+        inst["graph"].aux_feat = torch.cat([inst["graph"].gap_pos, zero_col], dim=-1)
+    return instances
 
 
 def instances_for_hosts(df, hosts, stats, edge_mode, min_remaining=2):
@@ -87,8 +131,14 @@ def train_one_model(model, train_instances, val_instances, lr=3e-4, epochs=200,
 
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
+    # scale warmup DOWN automatically for short runs -- a fixed 10-epoch
+    # warmup silently ate most of a 20-30 epoch test run during development
+    # and produced misleadingly bad results that looked like a real bug.
+    # This was never a correctness issue, just wasted epochs, but it's an
+    # easy trap to fall into if you ever lower search_epochs further.
+    effective_warmup = min(warmup_epochs, max(1, epochs // 4))
     scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda ep: min(1.0, (ep + 1) / max(warmup_epochs, 1))
+        optimizer, lr_lambda=lambda ep: min(1.0, (ep + 1) / effective_warmup)
     )
     loss_fn = torch.nn.MSELoss()
 
@@ -105,7 +155,7 @@ def train_one_model(model, train_instances, val_instances, lr=3e-4, epochs=200,
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            pred = model(batch.x, batch.edge_index, batch.batch, edge_attr=batch.edge_attr, gap_pos=batch.gap_pos)
+            pred = model(batch.x, batch.edge_index, batch.batch, edge_attr=batch.edge_attr, aux_feat=batch.aux_feat)
             loss = loss_fn(pred, batch.y.view(-1))
             loss.backward()
             # gradient clipping -- real archive data has much larger outliers
@@ -123,7 +173,7 @@ def train_one_model(model, train_instances, val_instances, lr=3e-4, epochs=200,
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
-                pred = model(batch.x, batch.edge_index, batch.batch, edge_attr=batch.edge_attr, gap_pos=batch.gap_pos)
+                pred = model(batch.x, batch.edge_index, batch.batch, edge_attr=batch.edge_attr, aux_feat=batch.aux_feat)
                 loss = loss_fn(pred, batch.y.view(-1))
                 val_loss += loss.item() * batch.num_graphs
         val_loss /= max(len(val_graphs), 1)
@@ -166,7 +216,7 @@ def evaluate_model(model, instances, device="cpu"):
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
-            pred = model(batch.x, batch.edge_index, batch.batch, edge_attr=batch.edge_attr, gap_pos=batch.gap_pos)
+            pred = model(batch.x, batch.edge_index, batch.batch, edge_attr=batch.edge_attr, aux_feat=batch.aux_feat)
             preds.extend(pred.cpu().numpy().tolist())
             targets.extend(batch.y.view(-1).cpu().numpy().tolist())
     preds, targets = np.array(preds), np.array(targets)
@@ -198,10 +248,26 @@ def search_space_grid():
 
 
 def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
-                   search_epochs=60, final_epochs=200,
-                   device="auto", batch_size=32, log_wandb=True, seed=42,
-                   min_remaining=2):
+                   search_epochs=150, final_epochs=200,
+                   device="auto", batch_size=16, log_wandb=False, seed=42,
+                   min_remaining=2, include_dynamite_feature=False):
     """
+    include_dynamite_feature (default False -- this is the PRIMARY,
+    thesis-relevant setting):
+      False -> aux_feat = [gap_pos, 0]. The GNN does NOT see DYNAMITE's
+        prediction. This is the honest test of your actual research
+        question: can a graph-based model independently beat DYNAMITE.
+        USE THIS as your headline/reported result.
+      True  -> aux_feat = [gap_pos, dynamite_pred]. The GNN sees DYNAMITE's
+        own prediction as an input feature and can learn a correction on
+        top of it. This answers a DIFFERENT question (does a hybrid/
+        ensemble improve on DYNAMITE) and should be reported separately,
+        explicitly labeled as a secondary/hybrid experiment -- NOT
+        presented as "the GNN beat DYNAMITE," since a model given its
+        competitor's answer as input has an unfair informational advantage.
+        Run this only after the primary (False) comparison, as a distinct,
+        clearly-labeled additional result.
+
     Speed notes (this was the slow part before):
       - search_epochs: used for ALL inner-search configs (there are 20 of
         them per outer fold = 100 total runs). This does NOT need to match
@@ -233,6 +299,10 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
     outer_results = []
     stratified_tables = []  # only populated if min_remaining=1
 
+    variant = "gnn_dynamite_augmented (secondary/hybrid -- NOT primary evidence)" \
+        if include_dynamite_feature else "gnn_pure (PRIMARY -- tests actual thesis question)"
+    print(f"\n{'='*70}\nRUN VARIANT: {variant}\n{'='*70}")
+
     for outer_i, (outer_train_hosts, outer_test_hosts) in enumerate(outer_folds):
         print(f"\n=== Outer fold {outer_i + 1}/{n_outer} ===")
         # fit normalization ONLY on outer-train systems -- no leakage from test
@@ -250,6 +320,17 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
 
         inner_train_inst = instances_for_hosts(df, inner_train_hosts, stats, edge_mode, min_remaining)
         inner_val_inst = instances_for_hosts(df, inner_val_hosts, stats, edge_mode, min_remaining)
+
+        # fit DYNAMITE-style's ratio on the INNER-TRAIN split only, apply to
+        # both inner-train and inner-val (same rule as normalization stats --
+        # never fit on data the model will be evaluated against)
+        inner_ratio_mean = fit_population_log_period_ratio(inner_train_inst)
+        if include_dynamite_feature:
+            attach_dynamite_feature(inner_train_inst, inner_ratio_mean)
+            attach_dynamite_feature(inner_val_inst, inner_ratio_mean)
+        else:
+            attach_null_aux_feature(inner_train_inst)
+            attach_null_aux_feature(inner_val_inst)
 
         # --- INNER SEARCH: fast screening pass (search_epochs), select by inner val loss only ---
         best_cfg, best_val_loss, best_model = None, float("inf"), None
@@ -277,6 +358,19 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
         full_train_inst = instances_for_hosts(df, outer_train_hosts, stats, edge_mode, min_remaining)
         test_inst = instances_for_hosts(df, outer_test_hosts, stats, edge_mode, min_remaining)
 
+        # refit the ratio on the FULL outer-train (larger than inner-train),
+        # apply consistently to full_train/val/test -- test still never
+        # influences the fit, only receives the already-fit statistic
+        full_ratio_mean = fit_population_log_period_ratio(full_train_inst)
+        if include_dynamite_feature:
+            attach_dynamite_feature(full_train_inst, full_ratio_mean)
+            attach_dynamite_feature(inner_val_inst, full_ratio_mean)  # refresh with the better-fit ratio
+            attach_dynamite_feature(test_inst, full_ratio_mean)
+        else:
+            attach_null_aux_feature(full_train_inst)
+            attach_null_aux_feature(inner_val_inst)
+            attach_null_aux_feature(test_inst)
+
         model_name, hidden_dim, n_layers = best_cfg
         kwargs = dict(hidden_dim=hidden_dim, n_layers=n_layers) if model_name != "deepsets" \
             else dict(hidden_dim=hidden_dim)
@@ -293,7 +387,7 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
 
         metrics = evaluate_model(final_model, test_inst, device=device)
         print(f"  OUTER TEST metrics: {metrics}")
-        outer_results.append({"outer_fold": outer_i, "config": best_cfg, **metrics})
+        outer_results.append({"outer_fold": outer_i, "config": best_cfg, "variant": variant, **metrics})
 
         if min_remaining == 1:
             strat = stratify_by_n_planets(final_model, test_inst, device=device)
@@ -337,13 +431,25 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
     return result
 
 
-def build_comparison_table(baseline_results: dict, gnn_summary_df: pd.DataFrame):
-    """Combine run_baselines()'s output with run_nested_cv()'s summary into
-    ONE table for easy sharing/comparison -- this is the table to paste into
-    your results chapter or share when asking for help.
+def build_comparison_table(baseline_results: dict, gnn_summary_df: pd.DataFrame,
+                            gnn_label: str = "gnn_pure (primary)",
+                            extra_gnn_variants: dict = None):
+    """Combine run_baselines()'s output with one or more run_nested_cv()
+    summaries into ONE table for easy sharing/comparison.
 
-    baseline_results: the dict returned by run_baselines.run_all_baselines()
-    gnn_summary_df: the 'summary' DataFrame returned by run_nested_cv()
+    gnn_label: how to label the primary gnn_summary_df passed in. Default
+      assumes you're passing the include_dynamite_feature=False run (the
+      one that actually tests your thesis question).
+    extra_gnn_variants: optional dict of {label: summary_df} for additional
+      GNN runs, e.g. the dynamite-augmented secondary experiment --
+      pass it here rather than as the primary argument so the table clearly
+      distinguishes "did the graph model beat DYNAMITE" from "did a hybrid
+      correction on top of DYNAMITE beat plain DYNAMITE," which are
+      different claims and should never be presented as the same result.
+
+    Example:
+      build_comparison_table(baseline_results, pure_gnn_results['summary'],
+          extra_gnn_variants={'gnn_dynamite_augmented (secondary)': augmented_results['summary']})
     """
     rows = []
     for method_name, fold_metrics in baseline_results.items():
@@ -351,9 +457,15 @@ def build_comparison_table(baseline_results: dict, gnn_summary_df: pd.DataFrame)
             vals = [f[key] for f in fold_metrics]
             rows.append({"method": method_name, "metric": key,
                          "mean": np.mean(vals), "std": np.std(vals)})
-    for key, row in gnn_summary_df.iterrows():
-        rows.append({"method": "gnn (best per fold)", "metric": key,
-                     "mean": row["mean"], "std": row["std"]})
+
+    gnn_variants = {gnn_label: gnn_summary_df}
+    if extra_gnn_variants:
+        gnn_variants.update(extra_gnn_variants)
+
+    for label, summary_df in gnn_variants.items():
+        for key, row in summary_df.iterrows():
+            rows.append({"method": label, "metric": key,
+                         "mean": row["mean"], "std": row["std"]})
 
     comparison_df = pd.DataFrame(rows)
     pivoted = comparison_df.pivot(index="method", columns="metric", values="mean")
@@ -361,6 +473,10 @@ def build_comparison_table(baseline_results: dict, gnn_summary_df: pd.DataFrame)
     combined = pivoted.round(4).astype(str) + " ± " + pivoted_std.round(4).astype(str)
 
     print("\n=== FULL COMPARISON TABLE (baselines vs GNN) ===")
+    if extra_gnn_variants:
+        print("NOTE: 'gnn_dynamite_augmented' rows are a SECONDARY/hybrid result --")
+        print("      they answer a different question than the primary gnn_pure row")
+        print("      and should not be cited as evidence the graph model alone beats DYNAMITE.")
     print(combined.to_string())
     combined.to_csv("full_comparison_table.csv")
     print("\nSaved: full_comparison_table.csv -- this is the one to share")

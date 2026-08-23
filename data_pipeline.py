@@ -205,6 +205,10 @@ def make_leave_one_out_instances(df: pd.DataFrame, stats: dict, edge_mode: str =
                 "graph": graph,
                 "target": torch.tensor(target_vec, dtype=torch.float),
                 "target_period_only": graph.y,
+                # original (pre-removal) system table, kept for visualization
+                # (visualize_graph.plot_system_graph needs the FULL system,
+                # not just the post-removal graph, to show what was masked)
+                "system_df": sys_sorted,
             })
     if skipped_nan > 0:
         print(f"  WARNING: skipped {skipped_nan} leave-one-out instances containing NaN "
