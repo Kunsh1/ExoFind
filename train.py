@@ -14,6 +14,7 @@ gets selected.
 import copy
 import itertools
 import numpy as np
+import pandas as pd
 import torch
 from torch_geometric.loader import DataLoader
 from sklearn.model_selection import StratifiedKFold
@@ -32,9 +33,31 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 
-def instances_for_hosts(df, hosts, stats, edge_mode):
+def instances_for_hosts(df, hosts, stats, edge_mode, min_remaining=2):
+    """min_remaining=2 (default) requires 3+ planet systems -- every instance
+    keeps real graph structure. Set min_remaining=1 to ALSO include 2-planet
+    systems (single remaining node, zero edges) -- these carry no relational
+    signal, so if you enable this, use stratify_by_n_planets() below to
+    report metrics separately rather than blending them into one number."""
     subset = df[df["hostname"].isin(hosts)]
-    return make_leave_one_out_instances(subset, stats, edge_mode=edge_mode)
+    return make_leave_one_out_instances(subset, stats, edge_mode=edge_mode, min_remaining=min_remaining)
+
+
+def stratify_by_n_planets(model, instances, device="cpu"):
+    """Break out evaluation metrics by ORIGINAL system multiplicity
+    (n_planets, i.e. before removal) so 2-planet-origin instances (if
+    included via min_remaining=1) don't silently blend into one number.
+    Returns a DataFrame: one row per n_planets bucket found in `instances`.
+    """
+    buckets = {}
+    for inst in instances:
+        buckets.setdefault(inst["n_planets"], []).append(inst)
+
+    rows = []
+    for n_planets, insts in sorted(buckets.items()):
+        m = evaluate_model(model, insts, device=device)
+        rows.append({"n_planets": n_planets, "n_instances": len(insts), **m})
+    return pd.DataFrame(rows)
 
 
 def train_one_model(model, train_instances, val_instances, lr=3e-4, epochs=200,
@@ -174,11 +197,41 @@ def search_space_grid():
     ))
 
 
-def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3, epochs=150,
-                   device="cpu", log_wandb=True, seed=42):
+def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
+                   search_epochs=60, final_epochs=200,
+                   device="auto", batch_size=32, log_wandb=True, seed=42,
+                   min_remaining=2):
+    """
+    Speed notes (this was the slow part before):
+      - search_epochs: used for ALL inner-search configs (there are 20 of
+        them per outer fold = 100 total runs). This does NOT need to match
+        your final training length -- its only job is to RANK configs
+        against each other, and that ranking is usually stable well before
+        200 epochs. Lowered default 150 -> 60, which alone cuts inner-search
+        compute by more than half.
+      - final_epochs: only used ONCE per outer fold, for the actual winning
+        config, retrained on the full outer-train set. Kept high (200) since
+        this run's quality is what actually gets reported.
+      - batch_size: raised default 16 -> 32. Your graphs are tiny (3-8
+        nodes), so bigger batches mean fewer Python-level loop iterations
+        per epoch for the same total work -- a real CPU speedup with no
+        accuracy cost at this data scale.
+      - device="auto": picks GPU automatically if Colab gives you one.
+        Given how small these graphs are, CPU is often still fine, but this
+        removes the decision from you -- if a GPU is available, use it.
+      - min_remaining=2 (default, unchanged behavior): 3+ planet systems
+        only. Set to 1 to ALSO include 2-planet systems as extra training
+        volume -- see stratify_by_n_planets() to report these separately
+        rather than blending them into your headline numbers.
+    """
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {device}")
+
     outer_folds = system_level_stratified_folds(df, n_splits=n_outer, seed=seed)
     in_dim = 9  # len(ALL_COLS) from data_pipeline
     outer_results = []
+    stratified_tables = []  # only populated if min_remaining=1
 
     for outer_i, (outer_train_hosts, outer_test_hosts) in enumerate(outer_folds):
         print(f"\n=== Outer fold {outer_i + 1}/{n_outer} ===")
@@ -195,17 +248,18 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3, epochs=150,
         inner_train_hosts = set(systems.iloc[inner_split[0]]["hostname"])
         inner_val_hosts = set(systems.iloc[inner_split[1]]["hostname"])
 
-        inner_train_inst = instances_for_hosts(df, inner_train_hosts, stats, edge_mode)
-        inner_val_inst = instances_for_hosts(df, inner_val_hosts, stats, edge_mode)
+        inner_train_inst = instances_for_hosts(df, inner_train_hosts, stats, edge_mode, min_remaining)
+        inner_val_inst = instances_for_hosts(df, inner_val_hosts, stats, edge_mode, min_remaining)
 
-        # --- INNER SEARCH: try every config, select by inner val loss only ---
+        # --- INNER SEARCH: fast screening pass (search_epochs), select by inner val loss only ---
         best_cfg, best_val_loss, best_model = None, float("inf"), None
         for model_name, hidden_dim, n_layers in search_space_grid():
             kwargs = dict(hidden_dim=hidden_dim, n_layers=n_layers) if model_name != "deepsets" \
                 else dict(hidden_dim=hidden_dim)
             model = build_model(model_name, in_dim, **kwargs)
             trained_model, val_loss = train_one_model(
-                model, inner_train_inst, inner_val_inst, epochs=epochs, device=device,
+                model, inner_train_inst, inner_val_inst, epochs=search_epochs,
+                device=device, batch_size=batch_size,
                 log_wandb=log_wandb,
                 wandb_config={"model": model_name, "hidden_dim": hidden_dim,
                                "n_layers": n_layers, "outer_fold": outer_i, "edge_mode": edge_mode},
@@ -219,9 +273,9 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3, epochs=150,
 
         print(f"  BEST inner config: {best_cfg} (val_loss={best_val_loss:.4f})")
 
-        # --- retrain best config on FULL outer-train, evaluate ONCE on outer-test ---
-        full_train_inst = instances_for_hosts(df, outer_train_hosts, stats, edge_mode)
-        test_inst = instances_for_hosts(df, outer_test_hosts, stats, edge_mode)
+        # --- retrain best config on FULL outer-train (full final_epochs budget), evaluate ONCE on outer-test ---
+        full_train_inst = instances_for_hosts(df, outer_train_hosts, stats, edge_mode, min_remaining)
+        test_inst = instances_for_hosts(df, outer_test_hosts, stats, edge_mode, min_remaining)
 
         model_name, hidden_dim, n_layers = best_cfg
         kwargs = dict(hidden_dim=hidden_dim, n_layers=n_layers) if model_name != "deepsets" \
@@ -229,7 +283,8 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3, epochs=150,
         final_model = build_model(model_name, in_dim, **kwargs)
         # reuse inner_val as a small validation set for early stopping during final fit
         final_model, _ = train_one_model(
-            final_model, full_train_inst, inner_val_inst, epochs=epochs, device=device,
+            final_model, full_train_inst, inner_val_inst, epochs=final_epochs,
+            device=device, batch_size=batch_size,
             log_wandb=log_wandb,
             wandb_config={**dict(zip(["model", "hidden_dim", "n_layers"], best_cfg)),
                            "outer_fold": outer_i, "stage": "final_refit"},
@@ -240,13 +295,76 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3, epochs=150,
         print(f"  OUTER TEST metrics: {metrics}")
         outer_results.append({"outer_fold": outer_i, "config": best_cfg, **metrics})
 
-    # aggregate
-    print("\n=== Aggregated results across outer folds (mean ± std) ===")
-    for key in ["mse", "mae", "hit_rate_0.5std"]:
-        vals = [r[key] for r in outer_results]
-        print(f"{key}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
+        if min_remaining == 1:
+            strat = stratify_by_n_planets(final_model, test_inst, device=device)
+            strat["outer_fold"] = outer_i
+            stratified_tables.append(strat)
 
-    return outer_results
+    # --- build both a per-fold table and an aggregated summary table ---
+    per_fold_df = pd.DataFrame(outer_results)
+    per_fold_df["model"] = per_fold_df["config"].apply(lambda c: c[0])
+    per_fold_df["hidden_dim"] = per_fold_df["config"].apply(lambda c: c[1])
+    per_fold_df["n_layers"] = per_fold_df["config"].apply(lambda c: c[2])
+    per_fold_df = per_fold_df.drop(columns=["config"])
+
+    summary_rows = []
+    for key in ["mse", "mae", "hit_rate_0.5std"]:
+        vals = per_fold_df[key].values
+        summary_rows.append({"metric": key, "mean": np.mean(vals), "std": np.std(vals)})
+    summary_df = pd.DataFrame(summary_rows).set_index("metric")
+
+    print("\n=== Per-fold results ===")
+    print(per_fold_df.to_string(index=False))
+    print("\n=== Aggregated results across outer folds (mean ± std) ===")
+    print(summary_df.round(4).to_string())
+
+    per_fold_df.to_csv("gnn_per_fold_results.csv", index=False)
+    summary_df.to_csv("gnn_summary_results.csv")
+    print("\nSaved: gnn_per_fold_results.csv, gnn_summary_results.csv")
+
+    result = {"per_fold": per_fold_df, "summary": summary_df, "raw": outer_results}
+
+    if stratified_tables:
+        strat_df = pd.concat(stratified_tables, ignore_index=True)
+        strat_summary = strat_df.groupby("n_planets")[["mse", "mae", "hit_rate_0.5std"]].agg(["mean", "std"])
+        print("\n=== Results stratified by ORIGINAL system multiplicity (n_planets) ===")
+        print("(2-planet-origin rows below carry weak/no relational signal --")
+        print(" compare them against 3+ rows, don't blend into one headline number)")
+        print(strat_summary.round(4).to_string())
+        strat_df.to_csv("gnn_stratified_by_multiplicity.csv", index=False)
+        result["stratified_by_n_planets"] = strat_summary
+
+    return result
+
+
+def build_comparison_table(baseline_results: dict, gnn_summary_df: pd.DataFrame):
+    """Combine run_baselines()'s output with run_nested_cv()'s summary into
+    ONE table for easy sharing/comparison -- this is the table to paste into
+    your results chapter or share when asking for help.
+
+    baseline_results: the dict returned by run_baselines.run_all_baselines()
+    gnn_summary_df: the 'summary' DataFrame returned by run_nested_cv()
+    """
+    rows = []
+    for method_name, fold_metrics in baseline_results.items():
+        for key in ["mse", "mae", "hit_rate_0.5std"]:
+            vals = [f[key] for f in fold_metrics]
+            rows.append({"method": method_name, "metric": key,
+                         "mean": np.mean(vals), "std": np.std(vals)})
+    for key, row in gnn_summary_df.iterrows():
+        rows.append({"method": "gnn (best per fold)", "metric": key,
+                     "mean": row["mean"], "std": row["std"]})
+
+    comparison_df = pd.DataFrame(rows)
+    pivoted = comparison_df.pivot(index="method", columns="metric", values="mean")
+    pivoted_std = comparison_df.pivot(index="method", columns="metric", values="std")
+    combined = pivoted.round(4).astype(str) + " ± " + pivoted_std.round(4).astype(str)
+
+    print("\n=== FULL COMPARISON TABLE (baselines vs GNN) ===")
+    print(combined.to_string())
+    combined.to_csv("full_comparison_table.csv")
+    print("\nSaved: full_comparison_table.csv -- this is the one to share")
+    return combined
 
 
 if __name__ == "__main__":
