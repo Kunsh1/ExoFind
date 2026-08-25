@@ -7,7 +7,144 @@ methodology-chapter figure showing how a real system gets represented.
 
 import networkx as nx
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
 import numpy as np
+
+
+def _build_full_system_graph(sys_df, edge_mode="complete"):
+    """Build the FULL, unmasked graph for one system -- no leave-one-out,
+    no removed node, every planet present. This is the 'before we skip any
+    planet' view."""
+    sys_sorted = sys_df.sort_values("pl_orbper").reset_index(drop=True)
+    n = len(sys_sorted)
+    periods = sys_sorted["pl_orbper"].values
+
+    G = nx.Graph()
+    labels = {}
+    for i in range(n):
+        row = sys_sorted.iloc[i]
+        name = row["pl_name"].split()[-1] if "pl_name" in row else str(i)
+        G.add_node(i, mass=row.get("pl_bmasse", 1.0))
+        labels[i] = name
+
+    if edge_mode == "adjacent":
+        pairs = [(i, i + 1) for i in range(n - 1)]
+    elif edge_mode == "complete":
+        pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    else:
+        raise ValueError(f"unknown edge_mode {edge_mode}")
+
+    for i, j in pairs:
+        log_ratio_dist = abs(np.log(periods[j] / periods[i]))
+        G.add_edge(i, j, weight=1.0 / (1.0 + log_ratio_dist),
+                   ratio=periods[max(i, j)] / periods[min(i, j)])
+
+    return G, labels
+
+
+def plot_all_systems_grid(df, min_planets=1, max_systems=16, edge_mode="complete",
+                           ncols=4, seed=42, show_edge_labels=True, save_path=None):
+    """ALL systems (or up to max_systems) in ONE figure, one subplot per
+    system, full unmasked graphs (every planet present -- this is the view
+    BEFORE any leave-one-out masking, showing exactly what nodes/edges look
+    like for the whole dataset). Renders inline in Colab by default
+    (save_path=None); pass a path only if you actually want a file.
+    """
+    systems = df.groupby("hostname").filter(lambda g: len(g) >= min_planets)
+    hostnames = list(systems["hostname"].unique())
+
+    if len(hostnames) > max_systems:
+        print(f"NOTE: {len(hostnames)} systems match min_planets={min_planets}, "
+              f"showing a random sample of {max_systems} (pass max_systems=N to change this).")
+        rng = np.random.RandomState(seed)
+        hostnames = list(rng.choice(hostnames, size=max_systems, replace=False))
+
+    n = len(hostnames)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows))
+    axes = np.atleast_1d(axes).flatten()
+
+    for ax, hostname in zip(axes, hostnames):
+        sys_df = df[df["hostname"] == hostname]
+        G, labels = _build_full_system_graph(sys_df, edge_mode=edge_mode)
+        pos = nx.spring_layout(G, weight="weight", seed=seed, k=1.5 / np.sqrt(max(len(G), 1)))
+
+        masses = np.array([G.nodes[i]["mass"] for i in G.nodes()])
+        sizes = 300 + 250 * np.log1p(masses)
+
+        nx.draw_networkx_edges(G, pos, width=1.5, alpha=0.5, edge_color="gray", ax=ax)
+        nx.draw_networkx_nodes(G, pos, node_color="steelblue", node_size=sizes, ax=ax, alpha=0.9)
+        nx.draw_networkx_labels(G, pos, labels=labels, font_size=7, font_weight="bold", ax=ax)
+        if show_edge_labels and len(G) <= 5:  # avoid unreadable clutter on dense/large systems
+            edge_labels = {(u, v): f"{G.edges[u, v]['ratio']:.1f}x" for u, v in G.edges()}
+            nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=6, ax=ax)
+
+        ax.set_title(hostname, fontsize=9)
+        ax.axis("off")
+
+    for ax in axes[len(hostnames):]:
+        ax.axis("off")
+
+    fig.suptitle(f"All systems, min_planets={min_planets}, edge_mode={edge_mode} "
+                 f"(full graphs, before any leave-one-out masking)", fontsize=12)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=120)
+    plt.show()
+    return fig
+
+
+def plot_all_systems_3d(df, min_planets=1, max_systems=9, edge_mode="complete",
+                         ncols=3, seed=42, save_path=None):
+    """3D version of the same idea -- node-link network per system, laid
+    out in 3D space via networkx's dim=3 spring layout, all systems in one
+    figure. Kept to a smaller default max_systems since 3D subplots get
+    visually crowded fast."""
+    systems = df.groupby("hostname").filter(lambda g: len(g) >= min_planets)
+    hostnames = list(systems["hostname"].unique())
+
+    if len(hostnames) > max_systems:
+        print(f"NOTE: {len(hostnames)} systems match min_planets={min_planets}, "
+              f"showing a random sample of {max_systems} (pass max_systems=N to change this).")
+        rng = np.random.RandomState(seed)
+        hostnames = list(rng.choice(hostnames, size=max_systems, replace=False))
+
+    n = len(hostnames)
+    nrows = int(np.ceil(n / ncols))
+    fig = plt.figure(figsize=(5 * ncols, 4.5 * nrows))
+
+    for idx, hostname in enumerate(hostnames):
+        ax = fig.add_subplot(nrows, ncols, idx + 1, projection="3d")
+        sys_df = df[df["hostname"] == hostname]
+        G, labels = _build_full_system_graph(sys_df, edge_mode=edge_mode)
+        pos3d = nx.spring_layout(G, weight="weight", seed=seed, dim=3,
+                                 k=1.5 / np.sqrt(max(len(G), 1)))
+
+        xs = [pos3d[i][0] for i in G.nodes()]
+        ys = [pos3d[i][1] for i in G.nodes()]
+        zs = [pos3d[i][2] for i in G.nodes()]
+        masses = np.array([G.nodes[i]["mass"] for i in G.nodes()])
+        sizes = 100 + 150 * np.log1p(masses)
+
+        edge_segs = [[pos3d[u], pos3d[v]] for u, v in G.edges()]
+        if edge_segs:
+            ax.add_collection3d(Line3DCollection(edge_segs, colors="gray", alpha=0.4, linewidths=1.2))
+
+        ax.scatter(xs, ys, zs, s=sizes, c="steelblue", edgecolors="black", depthshade=True)
+        for i in G.nodes():
+            ax.text(pos3d[i][0], pos3d[i][1], pos3d[i][2], labels[i], fontsize=7, fontweight="bold")
+
+        ax.set_title(hostname, fontsize=9)
+        ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+
+    fig.suptitle(f"All systems (3D), min_planets={min_planets}, edge_mode={edge_mode} "
+                 f"(full graphs, before any leave-one-out masking)", fontsize=12)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=120)
+    plt.show()
+    return fig
+
 
 
 def plot_network_graph(system_df, edge_mode="complete", removed_index=None,
