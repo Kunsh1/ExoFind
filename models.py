@@ -42,20 +42,32 @@ class BaseGNN(nn.Module):
     """
 
     def __init__(self, in_dim, hidden_dim=16, out_dim=1, n_layers=2, dropout=0.2,
-                 pooling="mean", edge_dim=2):
+                 pooling="mean", edge_dim=2, aux_dim=2):
         super().__init__()
         self.n_layers = n_layers
         self.dropout = dropout
         self.pooling = pooling
         self.edge_dim = edge_dim
+        self.aux_dim = aux_dim
         self.convs = nn.ModuleList()
         self._build_convs(in_dim, hidden_dim, n_layers)
-        # +1 input dim for gap_pos (WHERE in the sequence the missing planet
-        # sits -- 0=innermost gap, 1=outermost). Pooling alone discards this;
-        # concatenating it before the head gives the model the same
-        # positional signal the baselines already use via removed_index.
+        # aux_dim=2 by default: [gap_pos, dynamite_pred].
+        #   gap_pos: WHERE in the sequence the missing planet sits (0=innermost
+        #     gap, 1=outermost) -- pooling alone discards this; baselines get
+        #     it via removed_index.
+        #   dynamite_pred: the DYNAMITE-style baseline's OWN prediction for
+        #     this instance, fit on the same training fold. Giving the GNN
+        #     this as an input lets it learn a CORRECTION on top of the
+        #     statistical baseline (using the extra node features DYNAMITE
+        #     ignores -- mass, eccentricity, star properties) instead of
+        #     having to relearn the population-level period-ratio pattern
+        #     from scratch on ~230 systems. If the GNN finds no useful
+        #     correction, it can simply learn to pass dynamite_pred through
+        #     unchanged -- so this is a strict superset of DYNAMITE-style,
+        #     not a replacement, and should be at least as good as it archi
+        #     -tecturally, unlike the pure end-to-end version.
         self.head = nn.Sequential(
-            nn.Linear(hidden_dim + 1, hidden_dim),
+            nn.Linear(hidden_dim + aux_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, out_dim),
@@ -68,7 +80,7 @@ class BaseGNN(nn.Module):
         """Override in subclasses that consume edge_attr differently."""
         return conv(x, edge_index)
 
-    def forward(self, x, edge_index, batch, edge_attr=None, gap_pos=None):
+    def forward(self, x, edge_index, batch, edge_attr=None, aux_feat=None):
         for conv in self.convs:
             x = self._conv_forward(conv, x, edge_index, edge_attr)
             x = F.relu(x)
@@ -79,9 +91,9 @@ class BaseGNN(nn.Module):
             g = global_max_pool(x, batch)
         else:
             raise ValueError(f"unknown pooling {self.pooling}")
-        if gap_pos is None:
-            gap_pos = torch.zeros((g.size(0), 1), device=g.device)
-        g = torch.cat([g, gap_pos], dim=-1)
+        if aux_feat is None:
+            aux_feat = torch.zeros((g.size(0), self.aux_dim), device=g.device)
+        g = torch.cat([g, aux_feat], dim=-1)
         return self.head(g).squeeze(-1)
 
 
@@ -110,9 +122,9 @@ class GATModel(BaseGNN):
     attention weights for interpretability (Phase 5)."""
 
     def __init__(self, in_dim, hidden_dim=16, out_dim=1, n_layers=2, dropout=0.2,
-                 pooling="mean", heads=4, edge_dim=2):
+                 pooling="mean", heads=4, edge_dim=2, aux_dim=2):
         self.heads = heads
-        super().__init__(in_dim, hidden_dim, out_dim, n_layers, dropout, pooling, edge_dim)
+        super().__init__(in_dim, hidden_dim, out_dim, n_layers, dropout, pooling, edge_dim, aux_dim)
 
     def _build_convs(self, in_dim, hidden_dim, n_layers):
         dims = [in_dim] + [hidden_dim] * n_layers
@@ -122,7 +134,7 @@ class GATModel(BaseGNN):
             self.convs.append(GATConv(dims[i], out_channels, heads=self.heads, concat=concat,
                                        dropout=self.dropout, edge_dim=self.edge_dim))
 
-    def forward(self, x, edge_index, batch, edge_attr=None, gap_pos=None, return_attention=False):
+    def forward(self, x, edge_index, batch, edge_attr=None, aux_feat=None, return_attention=False):
         attn_weights = []
         for conv in self.convs:
             ea = edge_attr if (edge_attr is not None and edge_attr.numel() > 0) else None
@@ -134,9 +146,9 @@ class GATModel(BaseGNN):
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
         g = global_mean_pool(x, batch) if self.pooling == "mean" else global_max_pool(x, batch)
-        if gap_pos is None:
-            gap_pos = torch.zeros((g.size(0), 1), device=g.device)
-        g = torch.cat([g, gap_pos], dim=-1)
+        if aux_feat is None:
+            aux_feat = torch.zeros((g.size(0), self.aux_dim), device=g.device)
+        g = torch.cat([g, aux_feat], dim=-1)
         out = self.head(g).squeeze(-1)
         if return_attention:
             return out, attn_weights
@@ -176,18 +188,19 @@ class DeepSetsModel(nn.Module):
 
     def __init__(self, in_dim, hidden_dim=16, out_dim=1, dropout=0.2, **kwargs):
         super().__init__()
+        self.aux_dim = kwargs.get("aux_dim", 2)
         self.phi = nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
         self.rho = nn.Sequential(
-            nn.Linear(hidden_dim + 1, hidden_dim), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, out_dim)
+            nn.Linear(hidden_dim + self.aux_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, out_dim)
         )
 
-    def forward(self, x, edge_index, batch, edge_attr=None, gap_pos=None):
+    def forward(self, x, edge_index, batch, edge_attr=None, aux_feat=None):
         # edge_index/edge_attr ignored on purpose -- this is the whole point of the baseline
         h = self.phi(x)
         g = global_mean_pool(h, batch)
-        if gap_pos is None:
-            gap_pos = torch.zeros((g.size(0), 1), device=g.device)
-        g = torch.cat([g, gap_pos], dim=-1)
+        if aux_feat is None:
+            aux_feat = torch.zeros((g.size(0), self.aux_dim), device=g.device)
+        g = torch.cat([g, aux_feat], dim=-1)
         return self.rho(g).squeeze(-1)
 
 
