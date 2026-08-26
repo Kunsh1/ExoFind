@@ -425,3 +425,115 @@ def plot_gat_attention(system_df, edge_index, attn_weights, title=None, save_pat
     if save_path:
         plt.savefig(save_path, dpi=120)
     return ax
+
+
+def _build_combined_graph(df, min_planets=1, edge_mode="complete"):
+    """One networkx Graph containing ALL systems as separate connected
+    components -- node ids are prefixed with hostname so systems don't
+    collide, no edges are added BETWEEN systems (only within each), so
+    each system stays visually distinct as its own cluster."""
+    systems = df.groupby("hostname").filter(lambda g: len(g) >= min_planets)
+    G = nx.Graph()
+    labels = {}
+    for hostname, sys_df in systems.groupby("hostname"):
+        sys_sorted = sys_df.sort_values("pl_orbper").reset_index(drop=True)
+        n = len(sys_sorted)
+        periods = sys_sorted["pl_orbper"].values
+        node_ids = [f"{hostname}::{i}" for i in range(n)]
+
+        for i in range(n):
+            row = sys_sorted.iloc[i]
+            name = row["pl_name"].split()[-1] if "pl_name" in row else str(i)
+            G.add_node(node_ids[i], mass=row.get("pl_bmasse", 1.0), hostname=hostname)
+            labels[node_ids[i]] = name
+
+        if edge_mode == "adjacent":
+            pairs = [(i, i + 1) for i in range(n - 1)]
+        elif edge_mode == "complete":
+            pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        else:
+            raise ValueError(f"unknown edge_mode {edge_mode}")
+
+        for i, j in pairs:
+            log_ratio_dist = abs(np.log(periods[j] / periods[i]))
+            G.add_edge(node_ids[i], node_ids[j], weight=1.0 / (1.0 + log_ratio_dist))
+
+    return G, labels
+
+
+def plot_combined_network(df, min_planets=1, edge_mode="complete", seed=42,
+                           figsize=(16, 16), save_path=None):
+    """ALL systems on ONE networkx.draw() call -- every system is a
+    separate cluster (component) in a single combined graph, not separate
+    subplots. This is the full, unmasked structure (before any
+    leave-one-out removal)."""
+    G, labels = _build_combined_graph(df, min_planets=min_planets, edge_mode=edge_mode)
+    n_systems = df.groupby("hostname").filter(lambda g: len(g) >= min_planets)["hostname"].nunique()
+    print(f"Combined graph: {n_systems} systems, {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    if G.number_of_nodes() > 2000:
+        print("WARNING: large graph -- this may take a while to lay out and render, and be hard to read.")
+
+    pos = nx.spring_layout(G, weight="weight", seed=seed, k=1.2 / np.sqrt(max(G.number_of_nodes(), 1)))
+    masses = np.array([G.nodes[i]["mass"] for i in G.nodes()])
+    sizes = 80 + 60 * np.log1p(masses)
+
+    plt.figure(figsize=figsize)
+    nx.draw(G, pos, labels=labels, with_labels=True, node_color="steelblue",
+            node_size=sizes, edge_color="gray", width=0.6, alpha=0.85,
+            font_size=6, font_weight="bold")
+    plt.title(f"All systems combined -- {n_systems} systems, min_planets={min_planets}, "
+             f"edge_mode={edge_mode}\n(one networkx.draw() call, before any leave-one-out masking)")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=120)
+    plt.show()
+
+
+def plot_combined_network_3d_plotly(df, min_planets=1, edge_mode="complete", seed=42,
+                                    save_path=None):
+    """Interactive 3D version using Plotly -- rotate/zoom/hover, all
+    systems as one combined graph. fig.show() renders inline in Colab."""
+    import plotly.graph_objects as go
+
+    G, labels = _build_combined_graph(df, min_planets=min_planets, edge_mode=edge_mode)
+    n_systems = df.groupby("hostname").filter(lambda g: len(g) >= min_planets)["hostname"].nunique()
+    print(f"Combined graph: {n_systems} systems, {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+
+    pos = nx.spring_layout(G, weight="weight", seed=seed, dim=3,
+                           k=1.2 / np.sqrt(max(G.number_of_nodes(), 1)))
+
+    edge_x, edge_y, edge_z = [], [], []
+    for u, v in G.edges():
+        edge_x += [pos[u][0], pos[v][0], None]
+        edge_y += [pos[u][1], pos[v][1], None]
+        edge_z += [pos[u][2], pos[v][2], None]
+    edge_trace = go.Scatter3d(x=edge_x, y=edge_y, z=edge_z, mode="lines",
+                              line=dict(color="lightgray", width=2), hoverinfo="none")
+
+    node_x = [pos[i][0] for i in G.nodes()]
+    node_y = [pos[i][1] for i in G.nodes()]
+    node_z = [pos[i][2] for i in G.nodes()]
+    hover_text = [f"{G.nodes[i]['hostname']} - {labels[i]}" for i in G.nodes()]
+    masses = np.array([G.nodes[i]["mass"] for i in G.nodes()])
+    sizes = 4 + 3 * np.log1p(masses)
+
+    node_trace = go.Scatter3d(x=node_x, y=node_y, z=node_z, mode="markers+text",
+                              text=[labels[i] for i in G.nodes()], textposition="top center",
+                              textfont=dict(size=8),
+                              hovertext=hover_text, hoverinfo="text",
+                              marker=dict(size=sizes, color="steelblue", line=dict(color="black", width=0.5)))
+
+    fig = go.Figure(data=[edge_trace, node_trace])
+    fig.update_layout(
+        title=f"All systems combined (3D, interactive) -- {n_systems} systems, "
+              f"min_planets={min_planets}, edge_mode={edge_mode}",
+        showlegend=False,
+        scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+    if save_path:
+        # static PNG export needs Chrome/kaleido installed -- not required
+        # for interactive use, only if you specifically want a saved image
+        fig.write_image(save_path)
+    fig.show()
+    return fig
