@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import (
-    GCNConv, GATConv, SAGEConv, GINEConv, global_mean_pool, global_max_pool
+    GCNConv, GATConv, GATv2Conv, SAGEConv, GINEConv, global_mean_pool, global_max_pool
 )
 
 
@@ -155,6 +155,21 @@ class GATModel(BaseGNN):
         return out
 
 
+class GATv2Model(GATModel):
+    """Identical interface to GATModel -- only difference is GATv2Conv's
+    dynamic attention (attention ranking can change based on the query
+    node, unlike GAT's static ranking). Near drop-in upgrade; kept as a
+    separate registry entry so both can be compared directly in ablations."""
+
+    def _build_convs(self, in_dim, hidden_dim, n_layers):
+        dims = [in_dim] + [hidden_dim] * n_layers
+        for i in range(n_layers):
+            concat = i < n_layers - 1
+            out_channels = hidden_dim // self.heads if concat else hidden_dim
+            self.convs.append(GATv2Conv(dims[i], out_channels, heads=self.heads, concat=concat,
+                                        dropout=self.dropout, edge_dim=self.edge_dim))
+
+
 class GraphSAGEModel(BaseGNN):
     """SAGEConv has no native edge-feature support -- topology-only by
     construction. Kept as a useful ablation: does edge weighting actually
@@ -207,6 +222,7 @@ class DeepSetsModel(nn.Module):
 MODEL_REGISTRY = {
     "gcn": GCNModel,
     "gat": GATModel,
+    "gatv2": GATv2Model,
     "sage": GraphSAGEModel,
     "gin": GINModel,
     "deepsets": DeepSetsModel,

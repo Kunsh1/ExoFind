@@ -13,6 +13,7 @@ gets selected.
 
 import copy
 import itertools
+import time
 import numpy as np
 import pandas as pd
 import torch
@@ -23,6 +24,7 @@ from data_pipeline import (
     compute_normalization_stats,
     make_leave_one_out_instances,
     system_level_stratified_folds,
+    denormalize_period,
 )
 from models import build_model
 from baselines import fit_population_log_period_ratio, dynamite_style_baseline
@@ -77,14 +79,19 @@ def attach_null_aux_feature(instances):
     return instances
 
 
-def instances_for_hosts(df, hosts, stats, edge_mode, min_remaining=2):
+def instances_for_hosts(df, hosts, stats, edge_mode, min_remaining=2, **graph_kwargs):
     """min_remaining=2 (default) requires 3+ planet systems -- every instance
     keeps real graph structure. Set min_remaining=1 to ALSO include 2-planet
     systems (single remaining node, zero edges) -- these carry no relational
     signal, so if you enable this, use stratify_by_n_planets() below to
-    report metrics separately rather than blending them into one number."""
+    report metrics separately rather than blending them into one number.
+
+    **graph_kwargs: forwarded to build_system_graph via
+      make_leave_one_out_instances (resonance_tolerance, knn_k,
+      threshold_value, add_star_hub, edge_attr_mode)."""
     subset = df[df["hostname"].isin(hosts)]
-    return make_leave_one_out_instances(subset, stats, edge_mode=edge_mode, min_remaining=min_remaining)
+    return make_leave_one_out_instances(subset, stats, edge_mode=edge_mode,
+                                        min_remaining=min_remaining, **graph_kwargs)
 
 
 def stratify_by_n_planets(model, instances, device="cpu"):
@@ -207,24 +214,46 @@ def train_one_model(model, train_instances, val_instances, lr=3e-4, epochs=200,
     return model, best_val_loss
 
 
-def evaluate_model(model, instances, device="cpu"):
-    """Returns dict of metrics on a set of instances (call ONCE per outer test fold)."""
+def evaluate_model(model, instances, device="cpu", stats=None):
+    """Returns dict of metrics on a set of instances (call ONCE per outer test fold).
+
+    stats (optional): normalization stats dict, needed to also report
+    DYNAMITE-comparable metrics in REAL units (days), matching how
+    DYNAMITE's own papers judge success -- percentage error and
+    match-within-tolerance, e.g. "predicted period matched the real planet
+    within 10%/20%/50%" -- rather than only normalized log-space MSE, which
+    isn't directly comparable to anything reported in the DYNAMITE literature.
+    """
     graphs = [i["graph"] for i in instances]
     loader = DataLoader(graphs, batch_size=32, shuffle=False)
     model.eval()
     preds, targets = [], []
+    t0 = time.perf_counter()
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
             pred = model(batch.x, batch.edge_index, batch.batch, edge_attr=batch.edge_attr, aux_feat=batch.aux_feat)
             preds.extend(pred.cpu().numpy().tolist())
             targets.extend(batch.y.view(-1).cpu().numpy().tolist())
+    elapsed = time.perf_counter() - t0
+    ms_per_system = (elapsed / max(len(instances), 1)) * 1000
     preds, targets = np.array(preds), np.array(targets)
     mse = float(np.mean((preds - targets) ** 2))
     mae = float(np.mean(np.abs(preds - targets)))
     # hit rate: prediction within 0.5 std (in normalized log-period space) of truth
     hit_rate = float(np.mean(np.abs(preds - targets) < 0.5))
-    return {"mse": mse, "mae": mae, "hit_rate_0.5std": hit_rate}
+    result = {"mse": mse, "mae": mae, "hit_rate_0.5std": hit_rate, "ms_per_system": ms_per_system}
+
+    if stats is not None:
+        real_pred = denormalize_period(preds, stats)
+        real_true = denormalize_period(targets, stats)
+        pct_error = np.abs(real_pred - real_true) / real_true
+        result["mape_pct"] = float(np.median(pct_error) * 100)
+        # match-within-tolerance, mirroring how DYNAMITE papers report success
+        for tol in [0.10, 0.20, 0.50]:
+            result[f"match_within_{int(tol*100)}pct"] = float(np.mean(pct_error < tol))
+
+    return result
 
 
 def search_space_grid():
@@ -241,7 +270,7 @@ def search_space_grid():
     stable curves in your run), added hidden_dim=8 as a smaller option.
     """
     return list(itertools.product(
-        ["gcn", "gat", "sage", "gin", "deepsets"],  # model
+        ["gcn", "gat", "gatv2", "sage", "gin", "deepsets"],  # model -- added gatv2
         [8, 16],                                      # hidden_dim (was [16, 32])
         [1, 2],                                        # n_layers (was [2, 3])
     ))
@@ -250,8 +279,21 @@ def search_space_grid():
 def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
                    search_epochs=150, final_epochs=200,
                    device="auto", batch_size=16, log_wandb=False, seed=42,
-                   min_remaining=2, include_dynamite_feature=False):
+                   min_remaining=2, include_dynamite_feature=False,
+                   resonance_tolerance=0.05, knn_k=2, threshold_value=np.log(2.0),
+                   add_star_hub=False, edge_attr_mode="both"):
     """
+    NEW graph-structure parameters (forwarded to build_system_graph):
+      edge_mode: 'adjacent' | 'complete' | 'resonance' | 'knn' | 'threshold'
+      resonance_tolerance: only used if edge_mode='resonance' -- fractional
+        tolerance for matching a period ratio to a canonical resonance
+      knn_k: only used if edge_mode='knn' -- neighbors per node
+      threshold_value: only used if edge_mode='threshold' -- log-period-ratio cutoff
+      add_star_hub: adds one extra star-feature node connected to every planet,
+        independent of edge_mode
+      edge_attr_mode: 'both' | 'period_only' | 'mass_only' -- ablates which
+        edge signal (period ratio vs mass ratio) the GNN actually gets
+
     include_dynamite_feature (default False -- this is the PRIMARY,
     thesis-relevant setting):
       False -> aux_feat = [gap_pos, 0]. The GNN does NOT see DYNAMITE's
@@ -296,7 +338,13 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
 
     outer_folds = system_level_stratified_folds(df, n_splits=n_outer, seed=seed)
     in_dim = 9  # len(ALL_COLS) from data_pipeline
+    edge_dim = 1 if edge_attr_mode in ("period_only", "mass_only") else 2
+    graph_kwargs = dict(resonance_tolerance=resonance_tolerance, knn_k=knn_k,
+                        threshold_value=threshold_value, add_star_hub=add_star_hub,
+                        edge_attr_mode=edge_attr_mode)
     outer_results = []
+    outer_models = []             # trained model from each fold's final refit
+    outer_test_instances = []     # that fold's test instances, matching outer_models[i]
     stratified_tables = []  # only populated if min_remaining=1
 
     variant = "gnn_dynamite_augmented (secondary/hybrid -- NOT primary evidence)" \
@@ -318,8 +366,8 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
         inner_train_hosts = set(systems.iloc[inner_split[0]]["hostname"])
         inner_val_hosts = set(systems.iloc[inner_split[1]]["hostname"])
 
-        inner_train_inst = instances_for_hosts(df, inner_train_hosts, stats, edge_mode, min_remaining)
-        inner_val_inst = instances_for_hosts(df, inner_val_hosts, stats, edge_mode, min_remaining)
+        inner_train_inst = instances_for_hosts(df, inner_train_hosts, stats, edge_mode, min_remaining, **graph_kwargs)
+        inner_val_inst = instances_for_hosts(df, inner_val_hosts, stats, edge_mode, min_remaining, **graph_kwargs)
 
         # fit DYNAMITE-style's ratio on the INNER-TRAIN split only, apply to
         # both inner-train and inner-val (same rule as normalization stats --
@@ -335,7 +383,7 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
         # --- INNER SEARCH: fast screening pass (search_epochs), select by inner val loss only ---
         best_cfg, best_val_loss, best_model = None, float("inf"), None
         for model_name, hidden_dim, n_layers in search_space_grid():
-            kwargs = dict(hidden_dim=hidden_dim, n_layers=n_layers) if model_name != "deepsets" \
+            kwargs = dict(hidden_dim=hidden_dim, n_layers=n_layers, edge_dim=edge_dim) if model_name != "deepsets" \
                 else dict(hidden_dim=hidden_dim)
             model = build_model(model_name, in_dim, **kwargs)
             trained_model, val_loss = train_one_model(
@@ -355,8 +403,8 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
         print(f"  BEST inner config: {best_cfg} (val_loss={best_val_loss:.4f})")
 
         # --- retrain best config on FULL outer-train (full final_epochs budget), evaluate ONCE on outer-test ---
-        full_train_inst = instances_for_hosts(df, outer_train_hosts, stats, edge_mode, min_remaining)
-        test_inst = instances_for_hosts(df, outer_test_hosts, stats, edge_mode, min_remaining)
+        full_train_inst = instances_for_hosts(df, outer_train_hosts, stats, edge_mode, min_remaining, **graph_kwargs)
+        test_inst = instances_for_hosts(df, outer_test_hosts, stats, edge_mode, min_remaining, **graph_kwargs)
 
         # refit the ratio on the FULL outer-train (larger than inner-train),
         # apply consistently to full_train/val/test -- test still never
@@ -372,7 +420,7 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
             attach_null_aux_feature(test_inst)
 
         model_name, hidden_dim, n_layers = best_cfg
-        kwargs = dict(hidden_dim=hidden_dim, n_layers=n_layers) if model_name != "deepsets" \
+        kwargs = dict(hidden_dim=hidden_dim, n_layers=n_layers, edge_dim=edge_dim) if model_name != "deepsets" \
             else dict(hidden_dim=hidden_dim)
         final_model = build_model(model_name, in_dim, **kwargs)
         # reuse inner_val as a small validation set for early stopping during final fit
@@ -385,9 +433,11 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
             wandb_tags=["final_refit", model_name, f"outer{outer_i}"],
         )
 
-        metrics = evaluate_model(final_model, test_inst, device=device)
+        metrics = evaluate_model(final_model, test_inst, device=device, stats=stats)
         print(f"  OUTER TEST metrics: {metrics}")
         outer_results.append({"outer_fold": outer_i, "config": best_cfg, "variant": variant, **metrics})
+        outer_models.append(final_model)          # keep the trained model
+        outer_test_instances.append(test_inst)     # and its matching test instances (for plotting)
 
         if min_remaining == 1:
             strat = stratify_by_n_planets(final_model, test_inst, device=device)
@@ -402,7 +452,9 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
     per_fold_df = per_fold_df.drop(columns=["config"])
 
     summary_rows = []
-    for key in ["mse", "mae", "hit_rate_0.5std"]:
+    non_metric_cols = {"outer_fold", "variant", "model", "hidden_dim", "n_layers"}
+    metric_cols = [c for c in per_fold_df.columns if c not in non_metric_cols]
+    for key in metric_cols:
         vals = per_fold_df[key].values
         summary_rows.append({"metric": key, "mean": np.mean(vals), "std": np.std(vals)})
     summary_df = pd.DataFrame(summary_rows).set_index("metric")
@@ -416,7 +468,8 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
     summary_df.to_csv("gnn_summary_results.csv")
     print("\nSaved: gnn_per_fold_results.csv, gnn_summary_results.csv")
 
-    result = {"per_fold": per_fold_df, "summary": summary_df, "raw": outer_results}
+    result = {"per_fold": per_fold_df, "summary": summary_df, "raw": outer_results,
+              "models": outer_models, "test_instances": outer_test_instances}
 
     if stratified_tables:
         strat_df = pd.concat(stratified_tables, ignore_index=True)
@@ -453,7 +506,8 @@ def build_comparison_table(baseline_results: dict, gnn_summary_df: pd.DataFrame,
     """
     rows = []
     for method_name, fold_metrics in baseline_results.items():
-        for key in ["mse", "mae", "hit_rate_0.5std"]:
+        metric_keys = list(fold_metrics[0].keys()) if fold_metrics else []
+        for key in metric_keys:
             vals = [f[key] for f in fold_metrics]
             rows.append({"method": method_name, "metric": key,
                          "mean": np.mean(vals), "std": np.std(vals)})

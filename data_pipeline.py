@@ -17,6 +17,16 @@ FEATURE_COLS = ["pl_orbper", "pl_orbsmax", "pl_rade", "pl_bmasse", "pl_orbeccen"
 STAR_COLS = ["st_mass", "st_rad", "st_teff"]
 ALL_COLS = FEATURE_COLS + STAR_COLS
 
+# Optional, off-by-default extension -- most archive columns are metadata
+# (error bars, provenance IDs, formatting strings, photometric magnitudes
+# unrelated to orbital dynamics) and were deliberately excluded. These few
+# ARE physically relevant and reasonably well-populated, but weren't in the
+# original feature set. Not enabled by default because adding them requires
+# re-running the completeness filter (fewer systems will have ALL of these
+# populated) and re-validating the pipeline -- opt in explicitly.
+EXTENDED_FEATURE_COLS = ["pl_eqt", "pl_insol"]      # equilibrium temp, insolation flux (planet-level)
+EXTENDED_STAR_COLS = ["st_met", "st_age", "st_logg"]  # metallicity, age, surface gravity (star-level)
+
 
 def fetch_raw_data():
     """Pull the full composite parameters table from the archive.
@@ -80,67 +90,159 @@ def normalize_row(row, stats):
     return np.array(out, dtype=np.float32)
 
 
-def build_system_graph(system_df: pd.DataFrame, stats: dict, edge_mode: str = "adjacent"):
+def denormalize_period(pred_norm, stats):
+    """Inverse of normalize_row's pl_orbper transform: normalized log-space
+    prediction -> real period in days. Needed to report metrics DYNAMITE's
+    own papers actually use (percentage error, match-within-tolerance),
+    which are all in real units, not normalized log-space."""
+    mu, sigma = stats["pl_orbper"]
+    log_val = pred_norm * sigma + mu
+    return np.expm1(log_val)
+
+
+def build_system_graph(system_df: pd.DataFrame, stats: dict, edge_mode: str = "adjacent",
+                        resonance_tolerance: float = 0.05, knn_k: int = 2,
+                        threshold_value: float = np.log(2.0), add_star_hub: bool = False,
+                        edge_attr_mode: str = "both"):
     """Build a single graph for one system, planets sorted by orbital period.
 
     edge_mode:
-      'adjacent'  -> edges only between period-adjacent planets (sparse)
-      'complete'  -> fully connected graph
+      'adjacent'   -> edges only between period-adjacent planets (sparse chain)
+      'complete'   -> fully connected graph
+      'resonance'  -> only connect pairs whose period ratio sits near a simple
+                      fraction (mean-motion resonance), e.g. 3:2, 2:1. Real,
+                      physically-motivated dynamical relationships -- but can
+                      leave non-resonant systems very sparse or disconnected.
+                      Disconnected components still work fine (conv layers
+                      self-loop by default), they just get zero cross-
+                      component information, which is the honest, expected
+                      behavior for a system with no real resonances.
+      'knn'        -> each planet connects to its knn_k nearest neighbors in
+                      log-period space (union over both directions, so the
+                      graph stays undirected). Middle ground between
+                      'adjacent' and 'complete'.
+      'threshold'  -> connect any pair within threshold_value of each other
+                      in |log period ratio| (default log(2), i.e. within a
+                      factor of 2x). Similar spirit to knn, different knob
+                      (fixed distance cutoff instead of fixed neighbor count).
 
-    edge_attr now carries [log_period_ratio, log_mass_ratio] for each edge
-    (src->dst), computed directly from the already-normalized log-space
-    node features (x[:,0]=period, x[:,3]=mass), i.e. edge_attr = x[dst] - x[src]
-    on those two columns. This gives the GNN the SAME relational signal
-    DYNAMITE's population statistics use explicitly (period-ratio spacing),
-    instead of forcing it to infer relationships purely from unweighted
-    topology -- this was likely the main reason the GNN underperformed the
-    baselines in earlier runs, since baselines get this signal directly.
+    add_star_hub: if True, adds one extra node (index n, after all planets)
+      carrying ONLY the star's features (mass/radius/teff; planet-specific
+      slots zeroed), connected to every planet. Orthogonal to edge_mode --
+      combine with any of the above. Rationale: star features are already
+      copied onto every planet's own feature vector, so this isn't adding
+      new information per se -- it adds a structural shortcut (any two
+      planets are now at most 2 hops apart via the hub), which matters most
+      for sparse modes like 'adjacent' or 'resonance' where distant planets
+      might otherwise need many hops to exchange information.
+
+    edge_attr_mode: 'both' (default) = [log_period_ratio, log_mass_ratio],
+      'period_only' or 'mass_only' = single-column edge_attr, for ablating
+      which relational signal actually matters. Star-hub edges always get
+      a neutral [0, 0] (or single 0) attr, since a hub isn't a planet and
+      has no period/mass ratio to compute.
     """
     sys_sorted = system_df.sort_values("pl_orbper").reset_index(drop=True)
     n = len(sys_sorted)
+    periods = sys_sorted["pl_orbper"].values
 
     x = np.stack([normalize_row(sys_sorted.iloc[i], stats) for i in range(n)])
     x = torch.tensor(x, dtype=torch.float)
+
+    # PERIOD_IDX=0, MASS_IDX=3 in ALL_COLS -- see FEATURE_COLS ordering above
+    PERIOD_IDX, MASS_IDX = 0, 3
 
     edges = []
     if edge_mode == "adjacent":
         for i in range(n - 1):
             edges.append([i, i + 1])
-            edges.append([i + 1, i])  # bidirectional
+            edges.append([i + 1, i])
     elif edge_mode == "complete":
         for i in range(n):
             for j in range(n):
                 if i != j:
                     edges.append([i, j])
+    elif edge_mode == "resonance":
+        # canonical low-order mean-motion resonances (outer:inner ratios)
+        canonical_ratios = [1.5, 2.0, 4.0/3.0, 2.5, 5.0/3.0, 3.0, 5.0/2.0]
+        for i in range(n):
+            for j in range(i + 1, n):
+                ratio = periods[j] / periods[i]
+                if any(abs(ratio / r - 1.0) < resonance_tolerance for r in canonical_ratios):
+                    edges.append([i, j]); edges.append([j, i])
+        # NOTE: non-resonant systems may end up with ZERO edges -- this is
+        # intentional/honest, not a bug. Isolated nodes still get processed
+        # via self-loops inside the conv layers.
+    elif edge_mode == "knn":
+        log_periods = np.log(periods)
+        neighbor_pairs = set()
+        for i in range(n):
+            dists = np.abs(log_periods - log_periods[i])
+            dists[i] = np.inf
+            nearest = np.argsort(dists)[:knn_k]
+            for j in nearest:
+                neighbor_pairs.add((min(i, j), max(i, j)))
+        for i, j in neighbor_pairs:
+            edges.append([i, j]); edges.append([j, i])
+    elif edge_mode == "threshold":
+        log_periods = np.log(periods)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if abs(log_periods[j] - log_periods[i]) < threshold_value:
+                    edges.append([i, j]); edges.append([j, i])
     else:
         raise ValueError(f"unknown edge_mode {edge_mode}")
 
-    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous() if edges \
-        else torch.empty((2, 0), dtype=torch.long)
-    # NOTE: torch.tensor([]).t() gives the wrong shape ([0], not [2,0]) --
-    # this matters once single-node graphs are allowed (2-planet systems
-    # with one planet removed leave a single remaining node with zero edges)
-
-    # PERIOD_IDX=0, MASS_IDX=3 in ALL_COLS -- see FEATURE_COLS ordering above
-    PERIOD_IDX, MASS_IDX = 0, 3
+    edge_attr_dim = 1 if edge_attr_mode in ("period_only", "mass_only") else 2
     edge_attr = []
     for src, dst in edges:
         d_period = x[dst, PERIOD_IDX].item() - x[src, PERIOD_IDX].item()
         d_mass = x[dst, MASS_IDX].item() - x[src, MASS_IDX].item()
-        edge_attr.append([d_period, d_mass])
-    edge_attr = torch.tensor(edge_attr, dtype=torch.float) if edge_attr else torch.zeros((0, 2))
+        if edge_attr_mode == "period_only":
+            edge_attr.append([d_period])
+        elif edge_attr_mode == "mass_only":
+            edge_attr.append([d_mass])
+        elif edge_attr_mode == "both":
+            edge_attr.append([d_period, d_mass])
+        else:
+            raise ValueError(f"unknown edge_attr_mode {edge_attr_mode}")
+
+    if add_star_hub:
+        hub_idx = n
+        # hub feature vector: zeros for planet-specific slots (indices 0-5,
+        # i.e. FEATURE_COLS), real (already-normalized) star values for the
+        # star slots (indices 6-8, i.e. STAR_COLS) -- reuse any planet row's
+        # star columns since they're identical across planets in one system
+        hub_feat = x[0].clone()
+        hub_feat[:len(FEATURE_COLS)] = 0.0
+        x = torch.cat([x, hub_feat.unsqueeze(0)], dim=0)
+        for i in range(n):
+            edges.append([i, hub_idx]); edges.append([hub_idx, i])
+            edge_attr.append([0.0] * edge_attr_dim)
+            edge_attr.append([0.0] * edge_attr_dim)
+
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous() if edges \
+        else torch.empty((2, 0), dtype=torch.long)
+    # NOTE: torch.tensor([]).t() gives the wrong shape ([0], not [2,0]) --
+    # this matters for zero-edge cases (single remaining node, or a
+    # non-resonant system under edge_mode='resonance')
+    edge_attr = torch.tensor(edge_attr, dtype=torch.float) if edge_attr else torch.zeros((0, edge_attr_dim))
 
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr), sys_sorted
 
 
 def make_leave_one_out_instances(df: pd.DataFrame, stats: dict, edge_mode: str = "adjacent",
-                                  min_remaining: int = 2):
+                                  min_remaining: int = 2, **graph_kwargs):
     """For every system, for every planet, build one LOO instance:
       - graph WITHOUT that planet (built on the remaining planets)
       - target = normalized feature vector of the REMOVED planet
       - hostname is carried through for system-level fold splitting later
     Only pl_orbper is used as the primary regression target by default;
     the full normalized vector is kept in case you want to predict more.
+
+    **graph_kwargs: forwarded to build_system_graph (resonance_tolerance,
+      knn_k, threshold_value, add_star_hub, edge_attr_mode) -- see that
+      function's docstring for what each does.
 
     min_remaining controls whether 2-planet systems are usable:
       - min_remaining=2 (default): requires 3+ planet systems, so every
@@ -177,7 +279,7 @@ def make_leave_one_out_instances(df: pd.DataFrame, stats: dict, edge_mode: str =
             remaining = sys_sorted.drop(index=i).reset_index(drop=True)
             if len(remaining) < min_remaining:
                 continue
-            graph, _ = build_system_graph(remaining, stats, edge_mode=edge_mode)
+            graph, _ = build_system_graph(remaining, stats, edge_mode=edge_mode, **graph_kwargs)
             target_vec = normalize_row(sys_sorted.iloc[i], stats)
 
             if torch.isnan(graph.x).any() or np.isnan(target_vec).any():
