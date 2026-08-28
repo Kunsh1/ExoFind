@@ -147,7 +147,9 @@ def train_one_model(model, train_instances, val_instances, lr=3e-4, epochs=200,
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda ep: min(1.0, (ep + 1) / effective_warmup)
     )
+    # Loss Function
     loss_fn = torch.nn.MSELoss()
+    # loss_fn = torch.nn.SmoothL1Loss()
 
     # ALWAYS have a valid state to fall back to, even if training never
     # improves (e.g. every epoch produces NaN on unusual real-world outliers).
@@ -281,7 +283,7 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
                    device="auto", batch_size=16, log_wandb=False, seed=42,
                    min_remaining=2, include_dynamite_feature=False,
                    resonance_tolerance=0.05, knn_k=2, threshold_value=np.log(2.0),
-                   add_star_hub=False, edge_attr_mode="both"):
+                   add_star_hub=False, edge_attr_mode="both", use_extended=False):
     """
     NEW graph-structure parameters (forwarded to build_system_graph):
       edge_mode: 'adjacent' | 'complete' | 'resonance' | 'knn' | 'threshold'
@@ -337,7 +339,7 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
         print(f"Using device: {device}")
 
     outer_folds = system_level_stratified_folds(df, n_splits=n_outer, seed=seed)
-    in_dim = 9  # len(ALL_COLS) from data_pipeline
+    in_dim = None  # computed dynamically below, once we have real stats (was hardcoded 9)
     edge_dim = 1 if edge_attr_mode in ("period_only", "mass_only") else 2
     graph_kwargs = dict(resonance_tolerance=resonance_tolerance, knn_k=knn_k,
                         threshold_value=threshold_value, add_star_hub=add_star_hub,
@@ -354,7 +356,9 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
     for outer_i, (outer_train_hosts, outer_test_hosts) in enumerate(outer_folds):
         print(f"\n=== Outer fold {outer_i + 1}/{n_outer} ===")
         # fit normalization ONLY on outer-train systems -- no leakage from test
-        stats = compute_normalization_stats(df, outer_train_hosts)
+        stats = compute_normalization_stats(df, outer_train_hosts, use_extended=use_extended)
+        if in_dim is None:
+            in_dim = len(stats)  # dynamic -- adapts automatically if use_extended adds columns
 
         outer_train_df = df[df["hostname"].isin(outer_train_hosts)]
         systems = outer_train_df.drop_duplicates(subset="hostname")[["hostname", "sy_pnum"]]

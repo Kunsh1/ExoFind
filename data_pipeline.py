@@ -28,57 +28,91 @@ EXTENDED_FEATURE_COLS = ["pl_eqt", "pl_insol"]      # equilibrium temp, insolati
 EXTENDED_STAR_COLS = ["st_met", "st_age", "st_logg"]  # metallicity, age, surface gravity (star-level)
 
 
-def fetch_raw_data():
+def get_columns(use_extended: bool = False):
+    """Single source of truth for which columns are active. Everything
+    downstream (fetch, filter, normalize, graph-building, model in_dim)
+    should derive from this rather than hardcoding column lists, so turning
+    use_extended on/off can never silently desync one part of the pipeline
+    from another.
+    """
+    feature_cols = FEATURE_COLS + (EXTENDED_FEATURE_COLS if use_extended else [])
+    star_cols = STAR_COLS + (EXTENDED_STAR_COLS if use_extended else [])
+    return feature_cols, star_cols, feature_cols + star_cols
+
+
+def fetch_raw_data(use_extended: bool = False):
     """Pull the full composite parameters table from the archive.
     Requires: pip install astroquery
+
+    use_extended=True also pulls pl_eqt, pl_insol, st_met, st_age, st_logg
+    (see EXTENDED_FEATURE_COLS/EXTENDED_STAR_COLS above for rationale).
     """
     from astroquery.ipac.nexsci.nasa_exoplanet_archive import NasaExoplanetArchive
 
+    _, _, all_cols = get_columns(use_extended)
     table = NasaExoplanetArchive.query_criteria(
         table="pscomppars",
-        select="pl_name,hostname,sy_pnum," + ",".join(ALL_COLS),
+        select="pl_name,hostname,sy_pnum," + ",".join(all_cols),
     )
     return table.to_pandas()
 
 
-def filter_complete_multiplanet_systems(df: pd.DataFrame, min_planets: int = 3) -> pd.DataFrame:
-    """Keep only systems with >= min_planets AND complete data on ALL_COLS
-    (planet AND star columns) for every planet in the system.
+def filter_complete_multiplanet_systems(df: pd.DataFrame, min_planets: int = 3,
+                                        use_extended: bool = False) -> pd.DataFrame:
+    """Keep only systems with >= min_planets AND complete data on the active
+    column set (planet AND star columns) for every planet in the system.
 
     Star columns are filled with the system median first (star properties
     should be constant within a system; a few archive rows have inconsistent
     nulls). But if an ENTIRE system is missing star data, the per-system
     median is itself NaN and fillna does nothing -- that NaN would otherwise
     flow silently into the model and cause NaN loss on the first epoch.
-    So completeness is checked on ALL_COLS (after fillna), not just
-    FEATURE_COLS, to catch and drop those systems instead.
+    So completeness is checked on the full active column set (after fillna),
+    not just FEATURE_COLS, to catch and drop those systems instead.
+
+    use_extended=True: with more required columns, expect FEWER systems to
+    pass the completeness filter than the original ~290 (3+ planet) baseline
+    -- e.g. metallicity/age aren't measured for every star. Check
+    df['hostname'].nunique() after filtering and compare before committing
+    to the extended set as your primary pipeline.
     """
     df = df.copy()
+    _, star_cols, all_cols = get_columns(use_extended)
 
-    for col in STAR_COLS:
+    for col in star_cols:
         df[col] = df.groupby("hostname")[col].transform(lambda s: s.fillna(s.median()))
 
     def system_ok(g):
-        return len(g) >= min_planets and g[ALL_COLS].notna().all(axis=None)
+        return len(g) >= min_planets and g[all_cols].notna().all(axis=None)
 
     keep_hosts = df.groupby("hostname").filter(system_ok)["hostname"].unique()
     return df[df["hostname"].isin(keep_hosts)].reset_index(drop=True)
 
 
-def compute_normalization_stats(df: pd.DataFrame, hostnames_train):
+def compute_normalization_stats(df: pd.DataFrame, hostnames_train, use_extended: bool = False):
     """Fit log-scale mean/std ONLY on training-fold systems. Never call this
-    with test-fold data included -- that would be preprocessing leakage."""
+    with test-fold data included -- that would be preprocessing leakage.
+
+    The returned dict's keys (and their insertion order) become the single
+    source of truth for which columns are active downstream -- normalize_row
+    and build_system_graph both derive their column set FROM this dict
+    rather than a hardcoded list, so use_extended can never desync between
+    functions."""
     train_df = df[df["hostname"].isin(hostnames_train)]
+    _, _, all_cols = get_columns(use_extended)
     stats = {}
-    for col in ALL_COLS:
+    for col in all_cols:
         vals = np.log1p(train_df[col].values.astype(float))
         stats[col] = (vals.mean(), vals.std() + 1e-8)
     return stats
 
 
 def normalize_row(row, stats):
+    """Iterates over stats.keys() (NOT a hardcoded column list) so the
+    active column set is always whatever compute_normalization_stats() was
+    actually built with."""
     out = []
-    for col in ALL_COLS:
+    for col in stats.keys():
         mu, sigma = stats[col]
         v = np.log1p(float(row[col]))
         z = (v - mu) / sigma
@@ -149,8 +183,11 @@ def build_system_graph(system_df: pd.DataFrame, stats: dict, edge_mode: str = "a
     x = np.stack([normalize_row(sys_sorted.iloc[i], stats) for i in range(n)])
     x = torch.tensor(x, dtype=torch.float)
 
-    # PERIOD_IDX=0, MASS_IDX=3 in ALL_COLS -- see FEATURE_COLS ordering above
-    PERIOD_IDX, MASS_IDX = 0, 3
+    # derived from stats.keys() (NOT hardcoded) -- correct regardless of
+    # whether use_extended added more columns after these two
+    stats_keys = list(stats.keys())
+    PERIOD_IDX = stats_keys.index("pl_orbper")
+    MASS_IDX = stats_keys.index("pl_bmasse")
 
     edges = []
     if edge_mode == "adjacent":
@@ -209,12 +246,16 @@ def build_system_graph(system_df: pd.DataFrame, stats: dict, edge_mode: str = "a
 
     if add_star_hub:
         hub_idx = n
-        # hub feature vector: zeros for planet-specific slots (indices 0-5,
-        # i.e. FEATURE_COLS), real (already-normalized) star values for the
-        # star slots (indices 6-8, i.e. STAR_COLS) -- reuse any planet row's
-        # star columns since they're identical across planets in one system
+        # hub feature vector: zeros for planet-specific slots, real
+        # (already-normalized) star values for the star slots -- reuse any
+        # planet row's star columns since they're identical across planets
+        # in one system. n_feature computed from stats.keys() rather than
+        # hardcoded, so this stays correct whether or not use_extended added
+        # more columns (EXTENDED_STAR_COLS also treated as "star" here).
+        star_col_names = set(STAR_COLS + EXTENDED_STAR_COLS)
+        n_feature = sum(1 for k in stats_keys if k not in star_col_names)
         hub_feat = x[0].clone()
-        hub_feat[:len(FEATURE_COLS)] = 0.0
+        hub_feat[:n_feature] = 0.0
         x = torch.cat([x, hub_feat.unsqueeze(0)], dim=0)
         for i in range(n):
             edges.append([i, hub_idx]); edges.append([hub_idx, i])
