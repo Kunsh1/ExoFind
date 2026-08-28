@@ -27,29 +27,41 @@ ALL_COLS = FEATURE_COLS + STAR_COLS
 EXTENDED_FEATURE_COLS = ["pl_eqt", "pl_insol"]      # equilibrium temp, insolation flux (planet-level)
 EXTENDED_STAR_COLS = ["st_met", "st_age", "st_logg"]  # metallicity, age, surface gravity (star-level)
 
+# Gravity-related columns -- kept COMPLETELY SEPARATE from EXTENDED_*, own
+# toggle (use_gravity), can be combined with or without use_extended.
+# ttv_flag: whether transit timing variations were detected -- the direct
+#   observational signature of mutual gravitational perturbation between
+#   planets in a system.
+# pl_orblper: longitude of periastron -- relevant to apsidal alignment
+#   between planets' orbits, a real dynamical quantity.
+GRAVITY_COLS = ["ttv_flag", "pl_orblper"]
 
-def get_columns(use_extended: bool = False):
+
+def get_columns(use_extended: bool = False, use_gravity: bool = False):
     """Single source of truth for which columns are active. Everything
     downstream (fetch, filter, normalize, graph-building, model in_dim)
     should derive from this rather than hardcoding column lists, so turning
-    use_extended on/off can never silently desync one part of the pipeline
-    from another.
+    use_extended/use_gravity on/off can never silently desync one part of
+    the pipeline from another. The two toggles are independent -- any
+    combination of True/False is valid.
     """
-    feature_cols = FEATURE_COLS + (EXTENDED_FEATURE_COLS if use_extended else [])
+    feature_cols = FEATURE_COLS \
+        + (EXTENDED_FEATURE_COLS if use_extended else []) \
+        + (GRAVITY_COLS if use_gravity else [])
     star_cols = STAR_COLS + (EXTENDED_STAR_COLS if use_extended else [])
     return feature_cols, star_cols, feature_cols + star_cols
 
 
-def fetch_raw_data(use_extended: bool = False):
+def fetch_raw_data(use_extended: bool = False, use_gravity: bool = False):
     """Pull the full composite parameters table from the archive.
     Requires: pip install astroquery
 
-    use_extended=True also pulls pl_eqt, pl_insol, st_met, st_age, st_logg
-    (see EXTENDED_FEATURE_COLS/EXTENDED_STAR_COLS above for rationale).
+    use_extended=True also pulls pl_eqt, pl_insol, st_met, st_age, st_logg.
+    use_gravity=True (independent toggle) also pulls ttv_flag, pl_orblper.
     """
     from astroquery.ipac.nexsci.nasa_exoplanet_archive import NasaExoplanetArchive
 
-    _, _, all_cols = get_columns(use_extended)
+    _, _, all_cols = get_columns(use_extended, use_gravity)
     table = NasaExoplanetArchive.query_criteria(
         table="pscomppars",
         select="pl_name,hostname,sy_pnum," + ",".join(all_cols),
@@ -58,7 +70,8 @@ def fetch_raw_data(use_extended: bool = False):
 
 
 def filter_complete_multiplanet_systems(df: pd.DataFrame, min_planets: int = 3,
-                                        use_extended: bool = False) -> pd.DataFrame:
+                                        use_extended: bool = False,
+                                        use_gravity: bool = False) -> pd.DataFrame:
     """Keep only systems with >= min_planets AND complete data on the active
     column set (planet AND star columns) for every planet in the system.
 
@@ -75,9 +88,12 @@ def filter_complete_multiplanet_systems(df: pd.DataFrame, min_planets: int = 3,
     -- e.g. metallicity/age aren't measured for every star. Check
     df['hostname'].nunique() after filtering and compare before committing
     to the extended set as your primary pipeline.
+
+    use_gravity=True: independent of use_extended -- requires ttv_flag and
+    pl_orblper to also be complete. Check system count separately.
     """
     df = df.copy()
-    _, star_cols, all_cols = get_columns(use_extended)
+    _, star_cols, all_cols = get_columns(use_extended, use_gravity)
 
     for col in star_cols:
         df[col] = df.groupby("hostname")[col].transform(lambda s: s.fillna(s.median()))
@@ -89,17 +105,27 @@ def filter_complete_multiplanet_systems(df: pd.DataFrame, min_planets: int = 3,
     return df[df["hostname"].isin(keep_hosts)].reset_index(drop=True)
 
 
-def compute_normalization_stats(df: pd.DataFrame, hostnames_train, use_extended: bool = False):
+def compute_normalization_stats(df: pd.DataFrame, hostnames_train, use_extended: bool = False,
+                                use_gravity: bool = False):
     """Fit log-scale mean/std ONLY on training-fold systems. Never call this
     with test-fold data included -- that would be preprocessing leakage.
 
     The returned dict's keys (and their insertion order) become the single
     source of truth for which columns are active downstream -- normalize_row
     and build_system_graph both derive their column set FROM this dict
-    rather than a hardcoded list, so use_extended can never desync between
-    functions."""
+    rather than a hardcoded list, so use_extended/use_gravity can never
+    desync between functions.
+
+    NOTE on ttv_flag/pl_orblper (use_gravity=True): both get the same
+    log1p+zscore treatment as every other column for pipeline consistency.
+    This is a slight simplification for ttv_flag (a 0/1 indicator) and
+    pl_orblper (a periodic angle 0-360) -- neither is a perfect fit for
+    log-normal scaling, but z-scoring after log1p still produces a bounded,
+    reasonable input. Flagging this as a known simplification rather than
+    a claim it's the ideal transform for these two.
+    """
     train_df = df[df["hostname"].isin(hostnames_train)]
-    _, _, all_cols = get_columns(use_extended)
+    _, _, all_cols = get_columns(use_extended, use_gravity)
     stats = {}
     for col in all_cols:
         vals = np.log1p(train_df[col].values.astype(float))
@@ -137,7 +163,7 @@ def denormalize_period(pred_norm, stats):
 def build_system_graph(system_df: pd.DataFrame, stats: dict, edge_mode: str = "adjacent",
                         resonance_tolerance: float = 0.05, knn_k: int = 2,
                         threshold_value: float = np.log(2.0), add_star_hub: bool = False,
-                        edge_attr_mode: str = "both"):
+                        edge_attr_mode: str = "both", add_hill_radius_edge_feature: bool = False):
     """Build a single graph for one system, planets sorted by orbital period.
 
     edge_mode:
@@ -169,6 +195,19 @@ def build_system_graph(system_df: pd.DataFrame, stats: dict, edge_mode: str = "a
       planets are now at most 2 hops apart via the hub), which matters most
       for sparse modes like 'adjacent' or 'resonance' where distant planets
       might otherwise need many hops to exchange information.
+
+    add_hill_radius_edge_feature: appends ONE more edge_attr column = mutual
+      Hill radius spacing between the two planets on that edge, using
+      pl_orbsmax/pl_bmasse/st_mass (already in the base 9 columns -- no new
+      data pull needed). This is a standard dynamical-stability quantity
+      (same spirit as SPOCK's engineered features): planets separated by
+      few mutual Hill radii are dynamically "close" in a way raw period
+      ratio doesn't fully capture. Computed from RAW (pre-normalization)
+      values, then lightly rescaled (divided by 50, clipped to [-5,5]) for
+      numerical stability -- this is a fixed, non-data-driven rescaling
+      (unlike the proper per-column mean/std normalization elsewhere),
+      flagged as a known simplification. Star-hub edges get 0 for this
+      column (a star isn't a planet, no Hill radius to compute).
 
     edge_attr_mode: 'both' (default) = [log_period_ratio, log_mass_ratio],
       'period_only' or 'mass_only' = single-column edge_attr, for ablating
@@ -231,18 +270,42 @@ def build_system_graph(system_df: pd.DataFrame, stats: dict, edge_mode: str = "a
         raise ValueError(f"unknown edge_mode {edge_mode}")
 
     edge_attr_dim = 1 if edge_attr_mode in ("period_only", "mass_only") else 2
+    if add_hill_radius_edge_feature:
+        edge_attr_dim += 1
+
+    # raw (pre-normalization) values needed for a physically real Hill
+    # radius calculation -- normalized/log-scaled values won't do here
+    raw_sma = sys_sorted["pl_orbsmax"].values          # AU
+    raw_mass_earth = sys_sorted["pl_bmasse"].values     # Earth masses
+    raw_star_mass_solar = sys_sorted["st_mass"].values[0]  # Solar masses, same for whole system
+    EARTH_MASSES_PER_SOLAR_MASS = 332946.0
+
+    def hill_radius_feature(i, j):
+        m_i = raw_mass_earth[i] / EARTH_MASSES_PER_SOLAR_MASS
+        m_j = raw_mass_earth[j] / EARTH_MASSES_PER_SOLAR_MASS
+        r_hill_mutual = ((m_i + m_j) / (3.0 * raw_star_mass_solar)) ** (1.0 / 3.0) \
+            * ((raw_sma[i] + raw_sma[j]) / 2.0)
+        delta_hill = (raw_sma[j] - raw_sma[i]) / r_hill_mutual if r_hill_mutual > 0 else 0.0
+        # fixed rescaling (not data-driven mean/std like the main features) --
+        # typical delta_hill for real systems is O(1-100), this brings it to
+        # a numerically stable range. Documented simplification, not claimed optimal.
+        return float(np.clip(delta_hill / 50.0, -5.0, 5.0))
+
     edge_attr = []
     for src, dst in edges:
         d_period = x[dst, PERIOD_IDX].item() - x[src, PERIOD_IDX].item()
         d_mass = x[dst, MASS_IDX].item() - x[src, MASS_IDX].item()
         if edge_attr_mode == "period_only":
-            edge_attr.append([d_period])
+            row = [d_period]
         elif edge_attr_mode == "mass_only":
-            edge_attr.append([d_mass])
+            row = [d_mass]
         elif edge_attr_mode == "both":
-            edge_attr.append([d_period, d_mass])
+            row = [d_period, d_mass]
         else:
             raise ValueError(f"unknown edge_attr_mode {edge_attr_mode}")
+        if add_hill_radius_edge_feature:
+            row = row + [hill_radius_feature(src, dst)]
+        edge_attr.append(row)
 
     if add_star_hub:
         hub_idx = n

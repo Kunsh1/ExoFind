@@ -147,9 +147,7 @@ def train_one_model(model, train_instances, val_instances, lr=3e-4, epochs=200,
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda ep: min(1.0, (ep + 1) / effective_warmup)
     )
-    # Loss Function
     loss_fn = torch.nn.MSELoss()
-    # loss_fn = torch.nn.SmoothL1Loss()
 
     # ALWAYS have a valid state to fall back to, even if training never
     # improves (e.g. every epoch produces NaN on unusual real-world outliers).
@@ -283,8 +281,18 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
                    device="auto", batch_size=16, log_wandb=False, seed=42,
                    min_remaining=2, include_dynamite_feature=False,
                    resonance_tolerance=0.05, knn_k=2, threshold_value=np.log(2.0),
-                   add_star_hub=False, edge_attr_mode="both", use_extended=False):
+                   add_star_hub=False, edge_attr_mode="both", use_extended=False,
+                   use_gravity=False, add_hill_radius_edge_feature=False):
     """
+    use_gravity (default False, INDEPENDENT of use_extended -- do not
+      confuse the two): pulls in ttv_flag and pl_orblper as additional
+      planet-level features. Combine freely with use_extended=True/False.
+
+    add_hill_radius_edge_feature (default False): appends mutual Hill
+      radius spacing as an extra edge_attr column, computed from columns
+      already in your base 9 (no data pull needed). See
+      build_system_graph()'s docstring for the formula and caveats.
+
     NEW graph-structure parameters (forwarded to build_system_graph):
       edge_mode: 'adjacent' | 'complete' | 'resonance' | 'knn' | 'threshold'
       resonance_tolerance: only used if edge_mode='resonance' -- fractional
@@ -341,9 +349,12 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
     outer_folds = system_level_stratified_folds(df, n_splits=n_outer, seed=seed)
     in_dim = None  # computed dynamically below, once we have real stats (was hardcoded 9)
     edge_dim = 1 if edge_attr_mode in ("period_only", "mass_only") else 2
+    if add_hill_radius_edge_feature:
+        edge_dim += 1
     graph_kwargs = dict(resonance_tolerance=resonance_tolerance, knn_k=knn_k,
                         threshold_value=threshold_value, add_star_hub=add_star_hub,
-                        edge_attr_mode=edge_attr_mode)
+                        edge_attr_mode=edge_attr_mode,
+                        add_hill_radius_edge_feature=add_hill_radius_edge_feature)
     outer_results = []
     outer_models = []             # trained model from each fold's final refit
     outer_test_instances = []     # that fold's test instances, matching outer_models[i]
@@ -356,7 +367,8 @@ def run_nested_cv(df, edge_mode="adjacent", n_outer=5, n_inner=3,
     for outer_i, (outer_train_hosts, outer_test_hosts) in enumerate(outer_folds):
         print(f"\n=== Outer fold {outer_i + 1}/{n_outer} ===")
         # fit normalization ONLY on outer-train systems -- no leakage from test
-        stats = compute_normalization_stats(df, outer_train_hosts, use_extended=use_extended)
+        stats = compute_normalization_stats(df, outer_train_hosts, use_extended=use_extended,
+                                            use_gravity=use_gravity)
         if in_dim is None:
             in_dim = len(stats)  # dynamic -- adapts automatically if use_extended adds columns
 
